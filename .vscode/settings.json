@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "builtins.h": "c",
+        "geo_decls.h": "c",
+        "htup_details.h": "c",
+        "pg_list.h": "c",
+        "rangetypes.h": "c",
+        "fmgrprotos.h": "c"
+    },
+    "C_Cpp.errorSquiggles": "Disabled"
+}

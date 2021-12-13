@@ -138,6 +138,7 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+#include "utils/rangetypes.h"
 
 
 /* source-code-compatibility hacks for pull_varnos() API change */

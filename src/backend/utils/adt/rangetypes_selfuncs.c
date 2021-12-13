@@ -30,6 +30,8 @@
 #include "utils/selfuncs.h"
 #include "utils/typcache.h"
 
+static double strictlyleftofsel(TypeCacheEntry *typcache, const RangeBound *constbound, const RangeBound *minBound, const RangeBound *maxBound, const Datum *hist_frequency, int nhist_frequency, float8 width, bool equal);
+static double rangeoverlapsofsel(TypeCacheEntry *typcache, const RangeBound *constlower, const RangeBound *constupper, const RangeBound *minBound, const RangeBound *maxBound, const Datum *hist_frequency, int nhist_frequency, float8 width, bool equal);
 static double calc_rangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
 							const RangeType *constval, Oid operator);
 static double default_range_selectivity(Oid operator);
@@ -103,6 +105,176 @@ default_range_selectivity(Oid operator)
 }
 
 /*
+ *		Selectivity estimation for Range strictly left of "<<".
+ */
+double
+strictlyleftofsel(TypeCacheEntry *typcache, const RangeBound *constbound, const RangeBound *minBound, const RangeBound *maxBound,
+							 const Datum *hist_frequency, int nhist_frequency, float8 width, bool equal)
+{
+
+    Selectivity selec = 0 ;
+	float8 	num_rows = 0, 
+			total_rows_num = 0 ;
+	float8 compLower = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														  maxBound->val, constbound->val)); 
+	
+	float8 column_length = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														  maxBound->val, minBound->val));  
+	/*
+	 * Gets the index that corresponds to the lowerbound value corresponds to in the frequency histogram.
+	 */												  
+	int bin_index = div((column_length-compLower), width).quot ;
+
+	/*
+	 * Filters the index : 
+	 * - if the index exceeds the histograms length, it meansthe lowerbound value exceeds all
+	 * values of the tables, we thus set the index to be equal to the length of the histogram - 1.
+	 * - if the index is below zero, there will be no match in the selection, we thus return 0 for selectivity.
+	 * Once the index is filtered we compute a theoretical number of rows in our histogram which is the sum of all rows until the index
+	 * given by our lower bound. At the same time we compute the theoretical total number of rows that this histograms has.
+	 */
+	if(bin_index>=nhist_frequency){
+		bin_index = nhist_frequency-1 ;		
+	}
+	if(bin_index > 0){
+		for (int i = 0; i < nhist_frequency; i++)
+		{	
+			if(i < bin_index)
+				num_rows += DatumGetFloat8(hist_frequency[i]) ;
+			total_rows_num += DatumGetFloat8(hist_frequency[i]) ;
+		}
+	}
+	else{
+		return 0 ;
+	}
+
+	// Entropy
+	float8 entropy = 0 ;
+	float8 max_entropy = 0 ;
+	float8 probability = (float8) 1/nhist_frequency ;
+
+
+	/*
+	 * To further improve our estimation we will compute the entropy and the maximum entropy of our histogram.
+	 */
+	for (int i = 0; i < nhist_frequency; i++)
+	{
+		float8 current_frequency = DatumGetFloat8(hist_frequency[i]) ;
+		float8 current_probability = current_frequency/ total_rows_num ;
+
+		max_entropy -= probability*log2(probability) ;
+
+		if(current_frequency>0){
+			entropy -= current_probability*log2(current_probability) ;
+		}
+	}
+
+	/*
+	 * Computation of the selectivity.
+	 */
+	selec = (Selectivity) num_rows/(Selectivity) total_rows_num ;
+	selec *=sqrt(max_entropy/entropy) ;
+
+    CLAMP_PROBABILITY(selec);
+    return selec;
+}
+
+
+/*
+ *		Selectivity estimation for Range overlaps "&&".
+ */
+double 
+rangeoverlapsofsel(TypeCacheEntry *typcache, const RangeBound *constlower, const RangeBound *constupper, const RangeBound *minBound, const RangeBound *maxBound,
+							 const Datum *hist_frequency, int nhist_frequency, float8 width, bool equal)
+{
+	Selectivity selec = 0 ;
+	float8 		num_rows = 0, 
+				total_rows_num = 0 ;
+
+	float8 compLower 		= DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														  maxBound->val, constlower->val)); 
+	float8 compUpper 		= DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														  maxBound->val, constupper->val));							
+	float8 column_length 	= DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														  maxBound->val, minBound->val));  
+	/*
+	 * Gets the index that corresponds to the lowerbound and upperbound value corresponds to in the frequency histogram.
+	 */													  
+	int lower_index 		= div((column_length-compLower), width).quot - 1;
+	div_t upper_index_div 	= div((column_length-compUpper), width);
+	int upper_index 		= upper_index_div.quot + 1;
+
+	if (upper_index_div.rem>0){
+		upper_index++;
+	}
+
+	/*
+	 * Filters the index : 
+	 * - if the lower_index exceeds the histograms length, it means the lowerbound value exceeds all
+	 * values of the tables, we will thus have no overlap and return 0.
+	 * - if the upper_index exceeds the histograms length, it means the upper_ bound value exceeds all
+	 * values of the tables, we thus set the index to be equal to the length of the histogram - 1.
+	 * - if the lower_index is below zero, we set the lower_index to 0.
+	 * - if the upper_index is below zero, the will be no results and return 0.
+	 * Once the index is filtered we compute a theoretical number of rows in our histogram which is the sum of all rows until the index
+	 * given by our lower bound. At the same time we compute the theoretical total number of rows that this histograms has.
+	 */
+	if(lower_index>=nhist_frequency){
+		return 0;	
+	}else if (upper_index>=nhist_frequency){
+		upper_index = nhist_frequency-1 ;
+	}else if (lower_index<=0){
+		lower_index = 0;
+	}
+
+	if(upper_index>0){
+		for (int i = 0; i < nhist_frequency; i++)
+		{	
+			if(lower_index <= i && i<= upper_index)
+				num_rows += DatumGetFloat8(hist_frequency[i]) ;
+			total_rows_num += DatumGetFloat8(hist_frequency[i]) ;
+		}
+	}
+	else{
+		return 0 ;
+	}
+
+	// Entropy
+	float8 entropy = 0 ;
+	float8 max_entropy = 0 ;
+	float8 probability = (float8) 1/nhist_frequency ;
+
+	/*
+	 * To further improve our estimation we will compute the entropy and the maximum entropy of our histogram.
+	 */
+	for (int i = 0; i < nhist_frequency; i++)
+	{
+		float8 current_frequency = DatumGetFloat8(hist_frequency[i]) ;
+		float8 current_probability = current_frequency/ total_rows_num ;
+
+		max_entropy -= probability*log2(probability) ;
+
+		if(current_frequency>0){
+			entropy -= current_probability*log2(current_probability) ;
+		}
+	}
+
+	/*
+	 * Computation of the selectivity.
+	 */
+	selec = (Selectivity) num_rows/(Selectivity) total_rows_num ;
+	selec *= max_entropy/entropy;
+
+    CLAMP_PROBABILITY(selec);
+    return selec;
+}
+
+/*
  * rangesel -- restriction selectivity for range operators
  */
 Datum
@@ -118,7 +290,7 @@ rangesel(PG_FUNCTION_ARGS)
 	Selectivity selec;
 	TypeCacheEntry *typcache = NULL;
 	RangeType  *constrange = NULL;
-
+	
 	/*
 	 * If expression is not (variable op something) or (something op
 	 * variable), then punt and return a default estimate.
@@ -356,7 +528,7 @@ calc_rangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
 
 	/* all range operators are strict */
 	selec *= (1.0 - null_frac);
-
+	fflush(stdout) ;
 	/* result should be in range, but make sure... */
 	CLAMP_PROBABILITY(selec);
 
@@ -375,14 +547,20 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 {
 	AttStatsSlot hslot;
 	AttStatsSlot lslot;
-	int			nhist;
-	RangeBound *hist_lower;
-	RangeBound *hist_upper;
+	AttStatsSlot fslot;
+	int			nhist,
+				nhist_frequency;
+	RangeBound 	*hist_lower;
+	RangeBound 	*hist_upper;
+	Datum 		*hist_frequency;
 	int			i;
 	RangeBound	const_lower;
 	RangeBound	const_upper;
+	RangeBound 	minBound;
+	RangeBound 	maxBound;
 	bool		empty;
 	double		hist_selec;
+	float8 		width_frequency; 
 
 	/* Can't use the histogram with insecure range support functions */
 	if (!statistic_proc_security_check(vardata,
@@ -397,7 +575,10 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 	if (!(HeapTupleIsValid(vardata->statsTuple) &&
 		  get_attstatsslot(&hslot, vardata->statsTuple,
 						   STATISTIC_KIND_BOUNDS_HISTOGRAM, InvalidOid,
-						   ATTSTATSSLOT_VALUES)))
+						   ATTSTATSSLOT_VALUES)&& get_attstatsslot(&fslot, vardata->statsTuple,
+                             STATISTIC_KIND_FREQUENCY_HISTOGRAM,
+                             InvalidOid, ATTSTATSSLOT_VALUES)))
+        
 		return -1.0;
 
 	/* check that it's a histogram, not just a dummy entry */
@@ -412,8 +593,14 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 	 * bounds.
 	 */
 	nhist = hslot.nvalues;
+	nhist_frequency = fslot.nvalues;
+	hist_frequency = (Datum *) palloc(sizeof(Datum) * nhist_frequency-1);
 	hist_lower = (RangeBound *) palloc(sizeof(RangeBound) * nhist);
 	hist_upper = (RangeBound *) palloc(sizeof(RangeBound) * nhist);
+	width_frequency = DatumGetFloat8(fslot.values[0]);
+    for (int i = 0 ; i < nhist_frequency-1 ; i ++){
+        hist_frequency[i] = fslot.values[i+1] ;
+	}
 	for (i = 0; i < nhist; i++)
 	{
 		range_deserialize(typcache, DatumGetRangeTypeP(hslot.values[i]),
@@ -422,6 +609,11 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 		if (empty)
 			elog(ERROR, "bounds histogram contains an empty range");
 	}
+
+	minBound = hist_lower[0];
+	maxBound = hist_upper[nhist-1];
+
+
 
 	/* @> and @< also need a histogram of range lengths */
 	if (operator == OID_RANGE_CONTAINS_OP ||
@@ -451,7 +643,7 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 	/* Extract the bounds of the constant value. */
 	range_deserialize(typcache, constval, &const_lower, &const_upper, &empty);
 	Assert(!empty);
-
+	float8 selec;
 	/*
 	 * Calculate selectivity comparing the lower or upper bound of the
 	 * constant with the histogram of lower or upper bounds.
@@ -493,9 +685,11 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 
 		case OID_RANGE_LEFT_OP:
 			/* var << const when upper(var) < lower(const) */
-			hist_selec =
-				calc_hist_selectivity_scalar(typcache, &const_lower,
-											 hist_upper, nhist, false);
+			hist_selec = strictlyleftofsel(typcache, &const_lower, &minBound, &maxBound, hist_frequency, nhist_frequency-1, width_frequency, false);
+			
+			// hist_selec =
+			// 	calc_hist_selectivity_scalar(typcache, &const_lower,
+			// 								 hist_upper, nhist, false);
 			break;
 
 		case OID_RANGE_RIGHT_OP:
@@ -520,6 +714,12 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 			break;
 
 		case OID_RANGE_OVERLAP_OP:
+
+			// Définir une nouvelle fonction
+			hist_selec = rangeoverlapsofsel(typcache, &const_lower, &const_upper, &minBound, &maxBound, hist_frequency, nhist_frequency-1, width_frequency, false) ;
+
+
+			break ;
 		case OID_RANGE_CONTAINS_ELEM_OP:
 
 			/*

@@ -57,6 +57,8 @@ range_typanalyze(PG_FUNCTION_ARGS)
 	/* same as in std_typanalyze */
 	stats->minrows = 300 * attr->attstattarget;
 
+
+
 	PG_RETURN_BOOL(true);
 }
 
@@ -105,17 +107,49 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	int			empty_cnt = 0;
 	int			range_no;
 	int			slot_idx;
-	int			num_bins = stats->attr->attstattarget;
+	int			num_bins = stats->attr->attstattarget; // 100 pour notre cas
 	int			num_hist;
-	float8	   *lengths;
+
+	// Maximum value in the range column, comes from DatumGetInt16
+	
+	float8	   *lengths,
+				*frequencies; // [frequency histogram]
 	RangeBound *lowers,
 			   *uppers;
 	double		total_width = 0;
+
+
 
 	/* Allocate memory to hold range bounds and lengths of the sample ranges. */
 	lowers = (RangeBound *) palloc(sizeof(RangeBound) * samplerows);
 	uppers = (RangeBound *) palloc(sizeof(RangeBound) * samplerows);
 	lengths = (float8 *) palloc(sizeof(float8) * samplerows);
+	
+	fflush(stdout) ;
+
+	/**
+	 * [frequency histogram]
+	 * We first need to find the min and max bounds of the column
+	 */
+	RangeBound 	max_bound,
+				min_bound;
+
+	// Initial values to intitialize max_bound and min_bound
+	RangeType *initRange ;
+	
+	Datum initValue ;
+	bool initIsnull,
+		initEmpty ;
+
+	initValue = fetchfunc(stats, 0, &initIsnull);
+
+	initRange = DatumGetRangeTypeP(initValue);
+
+	range_deserialize(typcache, initRange, &min_bound, &max_bound, &initEmpty);
+
+	int16 initialMax = DatumGetInt16(max_bound.val) ;
+	int16 initialMin = DatumGetInt16(min_bound.val) ;
+	// End of initialization
 
 	/* Loop over the sample ranges. */
 	for (range_no = 0; range_no < samplerows; range_no++)
@@ -126,7 +160,8 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		RangeType  *range;
 		RangeBound	lower,
 					upper;
-		float8		length;
+		float8		length,
+					frequency; // [frequency histogram]
 
 		vacuum_delay_point();
 
@@ -144,6 +179,7 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		 */
 		total_width += VARSIZE_ANY(DatumGetPointer(value));
 
+
 		/* Get range and deserialize it for further analysis. */
 		range = DatumGetRangeTypeP(value);
 		range_deserialize(typcache, range, &lower, &upper, &empty);
@@ -153,6 +189,17 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			/* Remember bounds and length for further usage in histograms */
 			lowers[non_empty_cnt] = lower;
 			uppers[non_empty_cnt] = upper;
+
+			/**
+			 * [frequency histogram]
+			 * Comparison to keep the max bound and min bound
+			 */
+			if(range_cmp_bounds(typcache, &upper, &max_bound) > 0){
+				max_bound = upper ;
+			}
+			if(range_cmp_bounds(typcache, &lower, &min_bound) < 0){
+				min_bound = lower ;
+			}
 
 			if (lower.infinite || upper.infinite)
 			{
@@ -174,8 +221,9 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 				/* Use default value of 1.0 if no subdiff is available. */
 				length = 1.0;
 			}
-			lengths[non_empty_cnt] = length;
 
+			// here we fill the length array
+			lengths[non_empty_cnt] = length;
 			non_empty_cnt++;
 		}
 		else
@@ -191,11 +239,15 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	{
 		Datum	   *bound_hist_values;
 		Datum	   *length_hist_values;
+		Datum	   *frequency_hist_values;
 		int			pos,
 					posfrac,
 					delta,
 					deltafrac,
 					i;
+		// Attention à ne pas mettre "double" !!
+		float8  	width; // [frequency histogram]
+
 		MemoryContext old_cxt;
 		float4	   *emptyfrac;
 
@@ -203,6 +255,9 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		/* Do the simple null-frac and width stats */
 		stats->stanullfrac = (double) null_cnt / (double) samplerows;
 		stats->stawidth = total_width / (double) non_null_cnt;
+
+		// printf("%d\n", stats->stawidth);
+		// fflush(stdout);
 
 		/* Estimate that non-null values are unique */
 		stats->stadistinct = -1.0 * (1.0 - stats->stanullfrac);
@@ -217,14 +272,16 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		if (non_empty_cnt >= 2)
 		{
 			/* Sort bound values */
+			// Le minimum est dans lowers[0] !!
 			qsort_arg(lowers, non_empty_cnt, sizeof(RangeBound),
 					  range_bound_qsort_cmp, typcache);
 			qsort_arg(uppers, non_empty_cnt, sizeof(RangeBound),
 					  range_bound_qsort_cmp, typcache);
-
+			fflush(stdout) ;
 			num_hist = non_empty_cnt;
 			if (num_hist > num_bins)
 				num_hist = num_bins + 1;
+
 
 			bound_hist_values = (Datum *) palloc(num_hist * sizeof(Datum));
 
@@ -241,14 +298,20 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			 */
 			delta = (non_empty_cnt - 1) / (num_hist - 1);
 			deltafrac = (non_empty_cnt - 1) % (num_hist - 1);
+
+
+
 			pos = posfrac = 0;
 
 			for (i = 0; i < num_hist; i++)
 			{
+
+				// Bound hist content is a pointer to a range
 				bound_hist_values[i] = PointerGetDatum(range_serialize(typcache,
 																	   &lowers[pos],
 																	   &uppers[pos],
 																	   false));
+
 				pos += delta;
 				posfrac += deltafrac;
 				if (posfrac >= (num_hist - 1))
@@ -258,9 +321,17 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 					posfrac -= (num_hist - 1);
 				}
 			}
+			
+
 
 			stats->stakind[slot_idx] = STATISTIC_KIND_BOUNDS_HISTOGRAM;
 			stats->stavalues[slot_idx] = bound_hist_values;
+
+			/*
+			printf("%d \n", *bound_hist_values) ;
+			fflush(stdout) ;
+			*/
+
 			stats->numvalues[slot_idx] = num_hist;
 			slot_idx++;
 		}
@@ -293,12 +364,16 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			 * the integral and fractional parts of the sum separately.
 			 */
 			delta = (non_empty_cnt - 1) / (num_hist - 1);
+			// pour un tableau de 100 000 lignes, num_hist sera 101 et alors delta entier sera 999
 			deltafrac = (non_empty_cnt - 1) % (num_hist - 1);
+			// la partie décimale de delta sera de 99
+			
 			pos = posfrac = 0;
 
 			for (i = 0; i < num_hist; i++)
 			{
 				length_hist_values[i] = Float8GetDatum(lengths[pos]);
+
 				pos += delta;
 				posfrac += deltafrac;
 				if (posfrac >= (num_hist - 1))
@@ -308,6 +383,8 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 					posfrac -= (num_hist - 1);
 				}
 			}
+			fflush(stdout) ;
+			
 		}
 		else
 		{
@@ -338,7 +415,164 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		stats->stakind[slot_idx] = STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM;
 		slot_idx++;
 
+
+		/*
+		 * Generate a [frequency histogram] slot entry if there are at least two
+		 * values.
+		 * 
+		 * The frequency histogram carries two informations :
+		 * - The width of each bin : stored at index 0
+		 * - The values of the frequency for each bin : stored in the indexes 1 to (num_hist+1)
+		 */
+		if (non_empty_cnt >= 2)
+		{
+
+			// Similarly to length histogram and bounds histograms
+			num_hist = non_empty_cnt;
+			if (num_hist > num_bins)
+				num_hist = num_bins + 1;
+			
+			
+			/**
+			 * num_hist bins to store the frequencies, 1 bin to store the width
+			 * Frequencies are stored as floats
+			 */
+			frequency_hist_values = (Datum *) palloc((num_hist+1) * sizeof(Datum));
+			frequencies = palloc(num_hist*sizeof(float8)) ;
+
+
+			float8 frequency_at_index,
+					column_length ;
+			
+			// FH initialization
+			for (int i = 0; i < num_hist; i++)
+			{
+				frequencies[i] = 0 ;
+			}
+			
+			// We compute length by comparing max_bound and min_bound, previously stored
+			column_length = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														  max_bound.val, min_bound.val)); 
+			
+			// we take the entire part of the division
+			width = div(column_length,num_hist).quot  ;
+			// this avoids going out of bounds, even with reminder is 0
+			width ++ ;
+
+			/**
+			 * Need to iterate over the ranges of the sample rows
+			 * to locate the bins of the FH to increment
+			 */
+			for (int range_no = 0; range_no < samplerows ; range_no++)
+			{
+				
+				RangeType *current_range ;
+				RangeBound	current_lower,
+							current_upper;
+				Datum current_value ;
+				bool current_isnull,
+					current_isEmpty ;
+
+				current_value = fetchfunc(stats, range_no, &initIsnull);
+				current_range = DatumGetRangeTypeP(current_value);
+				range_deserialize(typcache, current_range, &current_lower, &current_upper, &current_isEmpty);
+
+
+				// Operations between the current range and the max_bound to find the relative position
+				float8 compLower, compUpper ;
+				compLower = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														  max_bound.val, current_lower.val)); 
+				compUpper = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														  max_bound.val, current_upper.val)); 
+
+
+				// Integer division to set bound to increment the histogram
+				int delta_low = div((column_length-compLower), width).quot ;
+				div_t delta_up_div = div((column_length-compUpper), width) ;
+				int delta_up = delta_up_div.quot ;
+				int rem = delta_up_div.rem; 
+
+				if(rem != 0){
+					delta_up ++ ;
+				}
+
+				// Increments the FH for each bin in the covered bins
+				for (int i = delta_low ; i < delta_up ; i++)
+				{
+					// Frequencies array is an array of float, we can just increment the values
+					frequencies[i]++ ;
+				}
+				
+			}
+
+			// Store the width pointer in the first element of the histogram
+			frequency_hist_values[0] = Float8GetDatum(width) ;
+
+			/**
+			 * Index = 0 has already been treated. For index > 0 we store the pointers
+			 * to the float frequencies in the frequencies array
+			 */
+			for (int idx = 1; idx < num_hist+1; idx++)
+			{
+				frequency_hist_values[idx] = Float8GetDatum(frequencies[idx-1]) ;
+			}
+
+			
+			 // Print of frequency histogram
+			
+			printf("frequence_histogram = WIDTH %f \n[", width);
+			for (i = 0; i < num_hist+1; i++)
+			{
+				int frequency = DatumGetFloat8(frequency_hist_values[i]) ;
+				printf("%d", frequency) ;
+				if (i < num_hist+1 - 1)
+					printf(", ");
+			}
+			printf("]\n") ;
+			
+			fflush(stdout) ;
+		}
+		else
+		{
+			/*
+			 * Even when we don't create the histogram, store an empty array
+			 * to mean "no histogram". We can't just leave stavalues NULL,
+			 * because get_attstatsslot() errors if you ask for stavalues, and
+			 * it's NULL. We'll still store the empty fraction in stanumbers.
+			 */
+			frequency_hist_values = palloc(0);
+			num_hist = 0;
+		}
+
+		
+
+		stats->staop[slot_idx] = Float8LessOperator;
+		stats->stacoll[slot_idx] = InvalidOid;
+		stats->stavalues[slot_idx] = frequency_hist_values;
+		stats->numvalues[slot_idx] = num_hist+1; // we add 1 for the width value at the index 0
+		stats->statypid[slot_idx] = FLOAT8OID;
+		stats->statyplen[slot_idx] = sizeof(float8);
+		stats->statypbyval[slot_idx] = FLOAT8PASSBYVAL;
+		stats->statypalign[slot_idx] = 'd';
+
+		/* Store the fraction of empty ranges */
+		emptyfrac = (float4 *) palloc(sizeof(float4));
+		*emptyfrac = ((double) empty_cnt) / ((double) non_null_cnt);
+		stats->stanumbers[slot_idx] = emptyfrac;
+		stats->numnumbers[slot_idx] = 1;
+
+		stats->stakind[slot_idx] = STATISTIC_KIND_FREQUENCY_HISTOGRAM;
+		slot_idx++;
+
+		
+
 		MemoryContextSwitchTo(old_cxt);
+
+
+		
 	}
 	else if (null_cnt > 0)
 	{
@@ -353,4 +587,7 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	 * We don't need to bother cleaning up any of our temporary palloc's. The
 	 * hashtable should also go away, as it used a child memory context.
 	 */
+
+
+
 }
